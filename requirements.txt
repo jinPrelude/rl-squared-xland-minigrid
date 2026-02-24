@@ -1,0 +1,7 @@
+xminigrid
+numpy
+jax
+flax
+optax
+rlax
+wandb
