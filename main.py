@@ -35,7 +35,7 @@ def parse_arguments():
     # Training
     parser.add_argument("--num-iter", type=int, default=10000)
     parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--episodes-per-trial", type=int, default=3)
+    parser.add_argument("--episodes-per-trial", type=int, default=10)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
     parser.add_argument("--action-emb-dim", type=int, default=16)
@@ -45,6 +45,8 @@ def parse_arguments():
     parser.add_argument("--lmbda", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=0.0005)
     parser.add_argument("--clip-eps", type=float, default=0.2)
+    parser.add_argument("--num-steps", type=int, default=243,
+                        help="TBPTT chunk length (default: full trial, no truncation)")
     # Evaluation
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--eval-num-envs", type=int, default=32)
@@ -83,6 +85,7 @@ def main():
         action_emb_dim=args.action_emb_dim,
         num_actions=num_actions,
         hidden_dim=args.hidden_dim,
+        num_steps=args.num_steps,
         rngs=rngs,
     )
     optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate), wrt=nnx.Param)
@@ -126,11 +129,18 @@ def main():
         advantages, returns = calculate_gae(transitions, next_value,
                                             gamma=args.gamma, lmbda=args.lmbda)
 
+        # Save reward metric before potential TBPTT reshape
+        train_reward_mean = float(transitions.reward.sum(axis=0).mean())
+
+        # === Prepare training data (model handles TBPTT internally if needed) ===
+        transitions, advantages, returns, initial_carry, effective_num_envs = \
+            model.prepare_training_data(transitions, advantages, returns, initial_carry)
+
         # === PPO update ===
-        num_minibatches = args.num_envs // args.envs_per_batch
+        num_minibatches = effective_num_envs // args.envs_per_batch
         for _ in range(args.num_epochs):
             rng, perm_rng = jax.random.split(rng)
-            env_indices = jax.random.permutation(perm_rng, args.num_envs)
+            env_indices = jax.random.permutation(perm_rng, effective_num_envs)
             env_indices = env_indices[:num_minibatches * args.envs_per_batch]
             minibatches = make_minibatches(transitions, advantages, returns,
                                            initial_carry, env_indices, args.envs_per_batch)
@@ -143,7 +153,7 @@ def main():
             "train/global_env_step": global_env_step,
             "train/actor_loss": metric_values["actor_loss"],
             "train/critic_loss": metric_values["critic_loss"],
-            "train/reward_mean": float(transitions.reward.sum(axis=0).mean()),
+            "train/reward_mean": train_reward_mean,
         }
 
         # === Evaluation on test benchmark (every eval_interval iterations) ===
