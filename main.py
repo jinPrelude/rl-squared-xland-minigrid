@@ -36,9 +36,10 @@ def parse_arguments():
     # Seeds
     parser.add_argument("--seed", type=int, default=0)
     # Training
-    parser.add_argument("--num-iter", type=int, default=10000)
+    parser.add_argument("--total-transitions", type=int, default=10_000_000_000, # 10B
+                        help="Total number of environment transitions to collect")
     parser.add_argument("--num-envs", type=int, default=256)
-    parser.add_argument("--episodes-per-trial", type=int, default=10)
+    parser.add_argument("--episodes-per-trial", type=int, default=15)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
     parser.add_argument("--action-emb-dim", type=int, default=16)
@@ -51,7 +52,8 @@ def parse_arguments():
     parser.add_argument("--num-steps", type=int, default=243,
                         help="TBPTT chunk length (default: full trial, no truncation)")
     # Evaluation
-    parser.add_argument("--eval-interval", type=int, default=10)
+    parser.add_argument("--eval-interval", type=int, default=100_000_000, # 0.1B
+                        help="Evaluate every this many transitions")
     parser.add_argument("--eval-num-envs", type=int, default=256)
     # Checkpoint
     parser.add_argument("--save-ckpt-dir", type=str, default="./checkpoints")
@@ -115,8 +117,12 @@ def main():
     eval_env_params = env_params.replace(ruleset=eval_rulesets)
 
     global_env_step = 0
+    iteration = 0
+    last_eval_step = 0
 
-    for iteration in range(args.num_iter):
+    transitions_per_iter = trial_length * args.num_envs
+
+    while global_env_step < args.total_transitions:
         # === Meta-episode setup ===
         rng, ruleset_rng, reset_rng, rollout_rng = jax.random.split(rng, 4)
 
@@ -140,7 +146,7 @@ def main():
             rollout_scan(model, env, meta_env_params, timestep, prev_action, prev_reward,
                          carry, rollout_rng, trial_length)
 
-        global_env_step += trial_length * args.num_envs
+        global_env_step += transitions_per_iter
 
         # === GAE (meta-RL: no episode boundary masking) ===
         next_value = bootstrap_value(model, final_timestep, final_prev_action,
@@ -175,8 +181,9 @@ def main():
             "train/reward_mean": train_reward_mean,
         }
 
-        # === Evaluation on test benchmark (every eval_interval iterations) ===
-        if (iteration + 1) % args.eval_interval == 0:
+        # === Evaluation on test benchmark (every eval_interval transitions) ===
+        if global_env_step - last_eval_step >= args.eval_interval:
+            last_eval_step = global_env_step
             rng, eval_run_rng = jax.random.split(rng)
 
             eval_rng_keys = jax.random.split(eval_run_rng, args.eval_num_envs)
@@ -192,14 +199,15 @@ def main():
 
             # === Save checkpoint ===
             _, state = nnx.split(model)
-            ckpt_mngr.save(iteration + 1, args=ocp.args.StandardSave(state))
+            ckpt_mngr.save(global_env_step, args=ocp.args.StandardSave(state))
 
         wandb.log(wandb_payload, step=global_env_step)
         metrics.reset()
+        iteration += 1
 
     # === Save final checkpoint ===
     _, state = nnx.split(model)
-    ckpt_mngr.save(args.num_iter, args=ocp.args.StandardSave(state))
+    ckpt_mngr.save(global_env_step, args=ocp.args.StandardSave(state))
     ckpt_mngr.wait_until_finished()
 
 
