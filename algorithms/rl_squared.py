@@ -142,15 +142,17 @@ def loss_fn(model, batch, clip_eps, ent_coef):
 def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2, ent_coef=0.01):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
-    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_step(carry, minibatch):
         model, optimizer, metrics = carry
         (loss, (actor_loss, critic_loss, entropy_loss)), grad = grad_fn(model, minibatch, clip_eps, ent_coef)
+        grad_norm = optax.global_norm(grad)
         optimizer.update(model, grad)
         metrics.update(actor_loss=actor_loss, critic_loss=critic_loss, entropy_loss=entropy_loss)
-        return model, optimizer, metrics
+        return (model, optimizer, metrics), grad_norm
 
-    scan_step((model, optimizer, metrics), minibatches)
+    _, grad_norms = scan_step((model, optimizer, metrics), minibatches)
+    return grad_norms
 
 
 def make_minibatches(transitions, advantages, returns, initial_carry, env_indices, envs_per_batch):

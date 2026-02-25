@@ -1,3 +1,4 @@
+import time
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -62,7 +63,7 @@ def parse_arguments():
     parser.add_argument("--num-steps", type=int, default=243,
                         help="TBPTT chunk length (default: full trial, no truncation)")
     # Evaluation
-    parser.add_argument("--eval-interval", type=int, default=100_000_000, # 0.1B
+    parser.add_argument("--eval-interval", type=int, default=200_000_000,
                         help="Evaluate every this many transitions")
     parser.add_argument("--eval-num-envs", type=int, default=4096)
     # Checkpoint
@@ -139,6 +140,8 @@ def main():
     transitions_per_iter = trial_length * args.num_envs
 
     while global_env_step < args.total_transitions:
+        iter_start = time.time()
+
         # === Meta-episode setup ===
         rng, ruleset_rng, reset_rng, rollout_rng = jax.random.split(rng, 4)
 
@@ -179,15 +182,22 @@ def main():
 
         # === PPO update ===
         effective_envs_per_batch = effective_num_envs // args.num_minibatches
+        all_grad_norms = []
         for _ in range(args.num_epochs):
             rng, perm_rng = jax.random.split(rng)
             env_indices = jax.random.permutation(perm_rng, effective_num_envs)
             env_indices = env_indices[:args.num_minibatches * effective_envs_per_batch]
             minibatches = make_minibatches(transitions, advantages, returns,
                                            initial_carry, env_indices, effective_envs_per_batch)
-            update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps, ent_coef=args.ent_coef)
+            grad_norms = update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps, ent_coef=args.ent_coef)
+            all_grad_norms.append(grad_norms)
 
         # === Logging ===
+        iter_elapsed = time.time() - iter_start
+        sps = transitions_per_iter / iter_elapsed
+
+        mean_grad_norm = float(jnp.mean(jnp.stack(all_grad_norms)))
+
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
         wandb_payload = {
             "train/iteration": iteration,
@@ -196,6 +206,8 @@ def main():
             "train/critic_loss": metric_values["critic_loss"],
             "train/entropy_loss": metric_values["entropy_loss"],
             "train/reward_mean": train_reward_mean,
+            "train/sps": sps,
+            "train/grad_norm": mean_grad_norm,
         }
 
         # === Evaluation on test benchmark (every eval_interval transitions) ===
