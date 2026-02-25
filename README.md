@@ -11,9 +11,12 @@ pip install -r requirements.txt
 
 # GPU: install JAX with proper CUDA version (e.g. CUDA 12)
 pip install "jax[cuda12]"
+
+# Log-in to WanDB
+wandb login
 ```
 
-## Usage
+## Train the model
 
 **1x A100** (original setup from XLand-MiniGrid paper)
 
@@ -25,4 +28,18 @@ python main.py --model gru --benchmark-id small-1m --num-envs 16384 --num-miniba
 
 ```bash
 python main.py --model gru --benchmark-id small-1m --num-envs 1024 --num-minibatches 4 --num-epochs 4
+```
+
+## Evaluate the model
+
+Batch-evaluate on the test benchmark and save per-environment results to CSV:
+
+```bash
+python eval_all.py --ckpt-dir <checkpoint-dir>
+```
+
+Visualize a single environment rollout as MP4 (use `env-index` from the CSV):
+
+```bash
+python eval_single.py --ckpt-dir <checkpoint-dir> --env-index 3856
 ```
