@@ -13,6 +13,7 @@ import xminigrid
 from xminigrid.wrappers import GymAutoResetWrapper, DirectionObservationWrapper
 
 from models.lstm import RL2LSTM
+from models.gru import RL2GRU
 from algorithms.rl_squared import (
     rollout_scan,
     bootstrap_value,
@@ -22,9 +23,14 @@ from algorithms.rl_squared import (
     evaluate,
 )
 
+# Constants from xminigrid.core.constants for observation encoder initialization
+NUM_TILES = 13
+NUM_COLORS = 12
 
-NUM_TILES = 13   # from xminigrid.core.constants
-NUM_COLORS = 12  # from xminigrid.core.constants
+MODEL_REGISTRY = {
+    "lstm": RL2LSTM,
+    "gru": RL2GRU,
+}
 
 
 def parse_arguments():
@@ -38,23 +44,27 @@ def parse_arguments():
     # Training
     parser.add_argument("--total-transitions", type=int, default=10_000_000_000, # 10B
                         help="Total number of environment transitions to collect")
-    parser.add_argument("--num-envs", type=int, default=256)
+    parser.add_argument("--num-envs", type=int, default=2048)
     parser.add_argument("--episodes-per-trial", type=int, default=15)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
     parser.add_argument("--action-emb-dim", type=int, default=16)
-    parser.add_argument("--envs-per-batch", type=int, default=128)
-    parser.add_argument("--num-epochs", type=int, default=4)
+    parser.add_argument("--num-minibatches", type=int, default=8)
+    parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--lmbda", type=float, default=0.97)
-    parser.add_argument("--learning-rate", type=float, default=0.0005)
+    parser.add_argument("--lmbda", type=float, default=0.95)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--clip-eps", type=float, default=0.2)
+    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--model", type=str, default="lstm", choices=["lstm", "gru"],
+                        help="Recurrent model type: lstm or gru")
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--num-steps", type=int, default=243,
                         help="TBPTT chunk length (default: full trial, no truncation)")
     # Evaluation
     parser.add_argument("--eval-interval", type=int, default=100_000_000, # 0.1B
                         help="Evaluate every this many transitions")
-    parser.add_argument("--eval-num-envs", type=int, default=256)
+    parser.add_argument("--eval-num-envs", type=int, default=4096)
     # Checkpoint
     parser.add_argument("--save-ckpt-dir", type=str, default="./checkpoints")
     return parser.parse_args()
@@ -62,7 +72,8 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    assert args.num_envs % args.envs_per_batch == 0
+    assert args.num_envs % args.num_minibatches == 0
+    envs_per_batch = args.num_envs // args.num_minibatches
 
     # --- Environment setup ---
     env, env_params = xminigrid.make(args.env_id)
@@ -82,14 +93,15 @@ def main():
 
     # --- Run name with datetime ---
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"rl2_{args.env_id}_{timestamp}"
+    run_name = f"rl2_{args.model}_{args.env_id}_{timestamp}"
 
     # --- W&B ---
     wandb.init(project="rl-squared-xland", name=run_name, config=vars(args))
 
     # --- Model & optimizer ---
     rngs = nnx.Rngs(args.seed)
-    model = RL2LSTM(
+    model_cls = MODEL_REGISTRY[args.model]
+    model = model_cls(
         num_tiles=NUM_TILES,
         num_colors=NUM_COLORS,
         obs_emb_dim=args.obs_emb_dim,
@@ -99,11 +111,15 @@ def main():
         num_steps=args.num_steps,
         rngs=rngs,
     )
-    optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(model, optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm),
+        optax.adam(args.learning_rate),
+    ), wrt=nnx.Param)
 
     metrics = nnx.metrics.MultiMetric(
         critic_loss=nnx.metrics.Average("critic_loss"),
         actor_loss=nnx.metrics.Average("actor_loss"),
+        entropy_loss=nnx.metrics.Average("entropy_loss"),
     )
 
     # --- Checkpoint manager ---
@@ -135,7 +151,7 @@ def main():
         reset_keys = jax.random.split(reset_rng, args.num_envs)
         timestep = jax.vmap(env.reset, in_axes=(0, 0))(meta_env_params, reset_keys)
 
-        # Initialize LSTM carry
+        # Initialize recurrent carry
         carry = model.init_carry(args.num_envs, rngs)
         initial_carry = jax.tree.map(lambda c: c.copy(), carry)
         prev_action = jnp.zeros(args.num_envs, dtype=jnp.int32)
@@ -162,14 +178,14 @@ def main():
             model.prepare_training_data(transitions, advantages, returns, initial_carry)
 
         # === PPO update ===
-        num_minibatches = effective_num_envs // args.envs_per_batch
+        effective_envs_per_batch = effective_num_envs // args.num_minibatches
         for _ in range(args.num_epochs):
             rng, perm_rng = jax.random.split(rng)
             env_indices = jax.random.permutation(perm_rng, effective_num_envs)
-            env_indices = env_indices[:num_minibatches * args.envs_per_batch]
+            env_indices = env_indices[:args.num_minibatches * effective_envs_per_batch]
             minibatches = make_minibatches(transitions, advantages, returns,
-                                           initial_carry, env_indices, args.envs_per_batch)
-            update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps)
+                                           initial_carry, env_indices, effective_envs_per_batch)
+            update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps, ent_coef=args.ent_coef)
 
         # === Logging ===
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
@@ -178,6 +194,7 @@ def main():
             "train/global_env_step": global_env_step,
             "train/actor_loss": metric_values["actor_loss"],
             "train/critic_loss": metric_values["critic_loss"],
+            "train/entropy_loss": metric_values["entropy_loss"],
             "train/reward_mean": train_reward_mean,
         }
 

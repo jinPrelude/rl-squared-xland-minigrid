@@ -115,7 +115,7 @@ def calculate_gae(transitions, next_value, gamma, lmbda):
     return advantages, returns
 
 
-def loss_fn(model, batch, clip_eps):
+def loss_fn(model, batch, clip_eps, ent_coef):
     (obs_img, obs_dir, prev_action, prev_reward, done,
      actions, old_log_probs, advantages, returns, init_carry) = batch
 
@@ -129,20 +129,25 @@ def loss_fn(model, batch, clip_eps):
     actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
     critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
 
-    total_loss = actor_loss + 0.5 * critic_loss
-    return total_loss, (actor_loss, critic_loss)
+    # Entropy bonus (negative because we maximize entropy)
+    probs = jax.nn.softmax(logits, axis=-1)
+    entropy = -(probs * log_probs).sum(axis=-1).mean()
+    entropy_loss = -entropy
+
+    total_loss = actor_loss + 0.5 * critic_loss + ent_coef * entropy_loss
+    return total_loss, (actor_loss, critic_loss, entropy_loss)
 
 
 @nnx.jit
-def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2):
+def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2, ent_coef=0.01):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
     def scan_step(carry, minibatch):
         model, optimizer, metrics = carry
-        (loss, (actor_loss, critic_loss)), grad = grad_fn(model, minibatch, clip_eps)
+        (loss, (actor_loss, critic_loss, entropy_loss)), grad = grad_fn(model, minibatch, clip_eps, ent_coef)
         optimizer.update(model, grad)
-        metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
+        metrics.update(actor_loss=actor_loss, critic_loss=critic_loss, entropy_loss=entropy_loss)
         return model, optimizer, metrics
 
     scan_step((model, optimizer, metrics), minibatches)

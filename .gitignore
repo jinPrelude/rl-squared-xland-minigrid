@@ -4,3 +4,4 @@ wandb/
 impl_resources
 AGENTS.md
 checkpoints/
+.vscode
