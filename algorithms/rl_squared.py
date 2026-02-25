@@ -117,7 +117,10 @@ def calculate_gae(transitions, next_value, gamma, lmbda):
 
 def loss_fn(model, batch, clip_eps, ent_coef):
     (obs_img, obs_dir, prev_action, prev_reward, done,
-     actions, old_log_probs, advantages, returns, init_carry) = batch
+     actions, old_log_probs, old_values, advantages, returns, init_carry) = batch
+
+    # Advantage normalization (per-minibatch)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     logits, values, _ = model.unroll(obs_img, obs_dir, prev_action, prev_reward, done, init_carry)
     values = values.squeeze(-1)
@@ -127,7 +130,13 @@ def loss_fn(model, batch, clip_eps, ent_coef):
 
     ratio = jnp.exp(selected_log_probs - old_log_probs)
     actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
-    critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
+
+    # Clipped value loss (PPO-style)
+    value_pred_clipped = old_values + (values - old_values).clip(-clip_eps, clip_eps)
+    critic_loss = 0.5 * jnp.maximum(
+        jnp.square(values - returns),
+        jnp.square(value_pred_clipped - returns),
+    ).mean()
 
     # Entropy bonus (negative because we maximize entropy)
     probs = jax.nn.softmax(logits, axis=-1)
@@ -172,6 +181,7 @@ def make_minibatches(transitions, advantages, returns, initial_carry, env_indice
         _gather(transitions.done),
         _gather(transitions.action),
         _gather(transitions.log_prob),
+        _gather(transitions.value),
         _gather(advantages),
         _gather(returns),
         jax.tree.map(lambda c: c[idx], initial_carry),
