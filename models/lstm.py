@@ -16,12 +16,11 @@ class RL2LSTM(RL2Model):
         num_actions: int,
         rnn_hidden_dim: int = 1024,
         head_hidden_dim: int = 256,
-        num_steps: int | None = None,
         *,
         rngs: nnx.Rngs,
     ):
-        # encoded_dim: 5*5*2*obs_emb_dim + action_emb_dim(dir) + action_emb_dim(act) + 1(reward) + 1(done)
-        encoded_dim = 5 * 5 * 2 * obs_emb_dim + 2 * action_emb_dim + 2
+        # CNN output: 2*2*64=256, plus dir_emb + act_emb + reward + done
+        encoded_dim = 256 + 2 * action_emb_dim + 2
 
         self.encoder = ObsEncoder(
             num_tiles, num_colors, obs_emb_dim, action_emb_dim, num_actions, rngs=rngs,
@@ -32,7 +31,6 @@ class RL2LSTM(RL2Model):
         self.fc_pi = nnx.Linear(head_hidden_dim, num_actions, rngs=rngs)
         self.fc_v = nnx.Linear(head_hidden_dim, 1, rngs=rngs)
         self.num_actions = num_actions
-        self.num_steps = num_steps  # TBPTT chunk size (None = no truncation)
 
     def init_carry(self, batch_size: int, rngs: nnx.Rngs):
         return self.lstm.initialize_carry((batch_size, self.lstm.in_features), rngs=rngs)
@@ -59,4 +57,3 @@ class RL2LSTM(RL2Model):
 
         final_carry, (logits, values) = jax.lax.scan(scan_step, init_carry, encoded_seq)
         return logits, values, final_carry
-

@@ -47,6 +47,8 @@ def parse_arguments():
                         help="Total number of environment transitions to collect")
     parser.add_argument("--num-envs", type=int, default=2048)
     parser.add_argument("--episodes-per-trial", type=int, default=15)
+    parser.add_argument("--num-steps-per-update", type=int, default=243,
+                        help="Steps per inner collect-update cycle (must divide trial_length)")
     parser.add_argument("--rnn-hidden-dim", type=int, default=1024)
     parser.add_argument("--head-hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
@@ -61,10 +63,8 @@ def parse_arguments():
     parser.add_argument("--model", type=str, default="lstm", choices=["lstm", "gru"],
                         help="Recurrent model type: lstm or gru")
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--num-steps", type=int, default=243,
-                        help="TBPTT chunk length (default: full trial, no truncation)")
     # Evaluation
-    parser.add_argument("--eval-interval", type=int, default=200_000_000,
+    parser.add_argument("--eval-interval", type=int, default=100_000_000,
                         help="Evaluate every this many transitions")
     parser.add_argument("--eval-num-envs", type=int, default=4096)
     # Checkpoint
@@ -85,6 +85,11 @@ def main():
     num_actions = env.num_actions(env_params)
     max_episode_steps = env_params.max_steps  # e.g., 243 for 9x9
     trial_length = args.episodes_per_trial * max_episode_steps
+
+    # Interleaved collect-update: trial split into inner updates
+    assert trial_length % args.num_steps_per_update == 0, \
+        f"trial_length ({trial_length}) must be divisible by num_steps_per_update ({args.num_steps_per_update})"
+    num_inner_updates = trial_length // args.num_steps_per_update
 
     # --- Benchmark: load and split into train/test ---
     benchmark = xminigrid.load_benchmark(args.benchmark_id)
@@ -111,7 +116,6 @@ def main():
         num_actions=num_actions,
         rnn_hidden_dim=args.rnn_hidden_dim,
         head_hidden_dim=args.head_hidden_dim,
-        num_steps=args.num_steps,
         rngs=rngs,
     )
     optimizer = nnx.Optimizer(model, optax.chain(
@@ -158,46 +162,48 @@ def main():
 
         # Initialize recurrent carry
         carry = model.init_carry(args.num_envs, rngs)
-        initial_carry = jax.tree.map(lambda c: c.copy(), carry)
         prev_action = jnp.zeros(args.num_envs, dtype=jnp.int32)
         prev_reward = jnp.zeros(args.num_envs)
 
-        # === Scan-based rollout ===
-        (final_timestep, final_prev_action, final_prev_reward, final_carry, _), transitions = \
-            rollout_scan(model, env, meta_env_params, timestep, prev_action, prev_reward,
-                         carry, rollout_rng, trial_length)
+        # === Interleaved collect-update inner loop ===
+        trial_reward = jnp.zeros(args.num_envs)
+        all_grad_norms = []
+
+        for _ in range(num_inner_updates):
+            # Save RNN state before collection (used as init_carry for PPO forward pass)
+            init_hstate = jax.tree.map(lambda c: c.copy(), carry)
+
+            # --- Collect num_steps_per_update steps ---
+            (timestep, prev_action, prev_reward, carry, rollout_rng), transitions = \
+                rollout_scan(model, env, meta_env_params, timestep, prev_action, prev_reward,
+                             carry, rollout_rng, args.num_steps_per_update)
+
+            # --- GAE (meta-RL: no episode boundary masking) ---
+            next_value = bootstrap_value(model, timestep, prev_action, prev_reward, carry)
+            advantages, returns = calculate_gae(transitions, next_value,
+                                                gamma=args.gamma, lmbda=args.lmbda)
+
+            # Accumulate rewards for logging
+            trial_reward = trial_reward + transitions.reward.sum(axis=0)
+
+            # --- PPO update ---
+            for _ in range(args.num_epochs):
+                rng, perm_rng = jax.random.split(rng)
+                env_indices = jax.random.permutation(perm_rng, args.num_envs)
+                env_indices = env_indices[:args.num_minibatches * envs_per_batch]
+                minibatches = make_minibatches(transitions, advantages, returns,
+                                               init_hstate, env_indices, envs_per_batch)
+                grad_norms = update_ppo(model, optimizer, minibatches, metrics,
+                                        clip_eps=args.clip_eps, ent_coef=args.ent_coef)
+                all_grad_norms.append(grad_norms)
 
         global_env_step += transitions_per_iter
-
-        # === GAE (meta-RL: no episode boundary masking) ===
-        next_value = bootstrap_value(model, final_timestep, final_prev_action,
-                                     final_prev_reward, final_carry)
-        advantages, returns = calculate_gae(transitions, next_value,
-                                            gamma=args.gamma, lmbda=args.lmbda)
-
-        # Save reward metric before potential TBPTT reshape
-        train_reward_mean = float(transitions.reward.sum(axis=0).mean())
-
-        # === Prepare training data (model handles TBPTT internally if needed) ===
-        transitions, advantages, returns, initial_carry, effective_num_envs = \
-            model.prepare_training_data(transitions, advantages, returns, initial_carry)
-
-        # === PPO update ===
-        effective_envs_per_batch = effective_num_envs // args.num_minibatches
-        all_grad_norms = []
-        for _ in range(args.num_epochs):
-            rng, perm_rng = jax.random.split(rng)
-            env_indices = jax.random.permutation(perm_rng, effective_num_envs)
-            env_indices = env_indices[:args.num_minibatches * effective_envs_per_batch]
-            minibatches = make_minibatches(transitions, advantages, returns,
-                                           initial_carry, env_indices, effective_envs_per_batch)
-            grad_norms = update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps, ent_coef=args.ent_coef)
-            all_grad_norms.append(grad_norms)
 
         # === Logging ===
         iter_elapsed = time.time() - iter_start
         sps = transitions_per_iter / iter_elapsed
 
+        train_reward_mean = float(trial_reward.mean())
         mean_grad_norm = float(jnp.mean(jnp.stack(all_grad_norms)))
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
