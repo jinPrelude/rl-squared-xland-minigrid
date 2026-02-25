@@ -25,6 +25,7 @@ class RolloutStats(struct.PyTreeNode):
     episodes_done: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0))
 
 
+@nnx.jit(static_argnames=('env', 'num_steps'))
 def rollout_scan(model, env, env_params, timestep, prev_action, prev_reward, carry, rng_key, num_steps):
     """Collect a rollout using jax.lax.scan. All env interactions are vmapped across envs.
 
@@ -149,24 +150,25 @@ def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2):
 
 def make_minibatches(transitions, advantages, returns, initial_carry, env_indices, envs_per_batch):
     """Partition transitions along env dimension into minibatches."""
-    mb_list = []
-    for start in range(0, env_indices.shape[0], envs_per_batch):
-        env_ids = env_indices[start:start + envs_per_batch]
-        mb = (
-            transitions.obs_img[:, env_ids],
-            transitions.obs_dir[:, env_ids],
-            transitions.prev_action[:, env_ids],
-            transitions.prev_reward[:, env_ids],
-            transitions.done[:, env_ids],
-            transitions.action[:, env_ids],
-            transitions.log_prob[:, env_ids],
-            advantages[:, env_ids],
-            returns[:, env_ids],
-            jax.tree.map(lambda c: c[env_ids], initial_carry),
-        )
-        mb_list.append(mb)
+    num_mb = env_indices.shape[0] // envs_per_batch
+    idx = env_indices.reshape(num_mb, envs_per_batch)
 
-    return jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *mb_list)
+    def _gather(arr):
+        # arr: (T, E, ...) -> (num_mb, T, envs_per_batch, ...)
+        return jnp.swapaxes(arr[:, idx], 0, 1)
+
+    return (
+        _gather(transitions.obs_img),
+        _gather(transitions.obs_dir),
+        _gather(transitions.prev_action),
+        _gather(transitions.prev_reward),
+        _gather(transitions.done),
+        _gather(transitions.action),
+        _gather(transitions.log_prob),
+        _gather(advantages),
+        _gather(returns),
+        jax.tree.map(lambda c: c[idx], initial_carry),
+    )
 
 
 def evaluate(model, env, env_params, rng_key, num_episodes):

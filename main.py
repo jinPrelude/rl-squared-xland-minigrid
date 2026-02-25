@@ -1,10 +1,13 @@
 from argparse import ArgumentParser
+from datetime import datetime
+from pathlib import Path
 
 import flax.nnx as nnx
 import jax
 from jax import numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import wandb
 import xminigrid
 from xminigrid.wrappers import GymAutoResetWrapper, DirectionObservationWrapper
@@ -34,12 +37,12 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=0)
     # Training
     parser.add_argument("--num-iter", type=int, default=10000)
-    parser.add_argument("--num-envs", type=int, default=64)
+    parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument("--episodes-per-trial", type=int, default=10)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
     parser.add_argument("--action-emb-dim", type=int, default=16)
-    parser.add_argument("--envs-per-batch", type=int, default=8)
+    parser.add_argument("--envs-per-batch", type=int, default=128)
     parser.add_argument("--num-epochs", type=int, default=4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.97)
@@ -48,8 +51,10 @@ def parse_arguments():
     parser.add_argument("--num-steps", type=int, default=243,
                         help="TBPTT chunk length (default: full trial, no truncation)")
     # Evaluation
-    parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--eval-num-envs", type=int, default=32)
+    parser.add_argument("--eval-interval", type=int, default=10)
+    parser.add_argument("--eval-num-envs", type=int, default=256)
+    # Checkpoint
+    parser.add_argument("--save-ckpt-dir", type=str, default="./checkpoints")
     return parser.parse_args()
 
 
@@ -73,8 +78,12 @@ def main():
     benchmark = benchmark.shuffle(shuffle_rng)
     train_benchmark, test_benchmark = benchmark.split(args.train_split)
 
+    # --- Run name with datetime ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"rl2_{args.env_id}_{timestamp}"
+
     # --- W&B ---
-    wandb.init(project="rl-squared-xland", name=f"rl2_{args.env_id}", config=vars(args))
+    wandb.init(project="rl-squared-xland", name=run_name, config=vars(args))
 
     # --- Model & optimizer ---
     rngs = nnx.Rngs(args.seed)
@@ -94,6 +103,16 @@ def main():
         critic_loss=nnx.metrics.Average("critic_loss"),
         actor_loss=nnx.metrics.Average("actor_loss"),
     )
+
+    # --- Checkpoint manager ---
+    ckpt_dir = (Path(args.save_ckpt_dir) / run_name).resolve()
+    ckpt_mngr = ocp.CheckpointManager(ckpt_dir)
+
+    # --- Fixed eval rulesets (sampled once for consistent evaluation) ---
+    rng, eval_ruleset_rng = jax.random.split(rng)
+    eval_ruleset_keys = jax.random.split(eval_ruleset_rng, args.eval_num_envs)
+    eval_rulesets = jax.vmap(test_benchmark.sample_ruleset)(eval_ruleset_keys)
+    eval_env_params = env_params.replace(ruleset=eval_rulesets)
 
     global_env_step = 0
 
@@ -158,11 +177,7 @@ def main():
 
         # === Evaluation on test benchmark (every eval_interval iterations) ===
         if (iteration + 1) % args.eval_interval == 0:
-            rng, eval_ruleset_rng, eval_run_rng = jax.random.split(rng, 3)
-
-            eval_ruleset_keys = jax.random.split(eval_ruleset_rng, args.eval_num_envs)
-            eval_rulesets = jax.vmap(test_benchmark.sample_ruleset)(eval_ruleset_keys)
-            eval_env_params = env_params.replace(ruleset=eval_rulesets)
+            rng, eval_run_rng = jax.random.split(rng)
 
             eval_rng_keys = jax.random.split(eval_run_rng, args.eval_num_envs)
 
@@ -175,8 +190,17 @@ def main():
             wandb_payload["test/reward_median"] = float(jnp.median(eval_stats.reward_sum))
             wandb_payload["test/length_mean"] = float(eval_stats.length_sum.mean())
 
+            # === Save checkpoint ===
+            _, state = nnx.split(model)
+            ckpt_mngr.save(iteration + 1, args=ocp.args.StandardSave(state))
+
         wandb.log(wandb_payload, step=global_env_step)
         metrics.reset()
+
+    # === Save final checkpoint ===
+    _, state = nnx.split(model)
+    ckpt_mngr.save(args.num_iter, args=ocp.args.StandardSave(state))
+    ckpt_mngr.wait_until_finished()
 
 
 if __name__ == "__main__":
