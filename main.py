@@ -23,8 +23,8 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-transitions", type=int, default=10_000_000_000)
     parser.add_argument("--num-envs", type=int, default=2048)
-    parser.add_argument("--episodes-per-trial", type=int, default=15)
-    parser.add_argument("--num-steps-per-update", type=int, default=243)
+    parser.add_argument("--num-steps-per-env", type=int, default=2560)
+    parser.add_argument("--num-steps-per-update", type=int, default=256)
     parser.add_argument("--rnn-hidden-dim", type=int, default=1024)
     parser.add_argument("--head-hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
@@ -51,10 +51,9 @@ def main():
 
     env, env_params = make_env(args.env_id)
     num_actions = env.num_actions(env_params)
-    trial_length = args.episodes_per_trial * env_params.max_steps
 
-    assert trial_length % args.num_steps_per_update == 0
-    num_inner_updates = trial_length // args.num_steps_per_update
+    assert args.num_steps_per_env % args.num_steps_per_update == 0
+    num_inner_updates = args.num_steps_per_env // args.num_steps_per_update
 
     benchmark = xminigrid.load_benchmark(args.benchmark_id)
     rng = jax.random.key(args.seed)
@@ -93,7 +92,7 @@ def main():
 
     global_env_step = 0
     last_eval_step = 0
-    transitions_per_iter = trial_length * args.num_envs
+    transitions_per_iter = args.num_steps_per_env * args.num_envs
 
     while global_env_step < args.total_transitions:
         iter_start = time.time()
@@ -149,8 +148,8 @@ def main():
             rng, eval_run_rng = jax.random.split(rng)
             eval_rng_keys = jax.random.split(eval_run_rng, args.eval_num_envs)
 
-            eval_stats = jax.vmap(
-                lambda rng_k, params: evaluate(model, env, params, rng_k, args.episodes_per_trial),
+            eval_stats, _ = jax.vmap(
+                lambda rng_k, params: evaluate(model, env, params, rng_k, args.num_steps_per_env),
                 in_axes=(0, 0),
             )(eval_rng_keys, eval_env_params)
 

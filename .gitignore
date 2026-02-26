@@ -1,7 +1,8 @@
+.DS_Store
+.vscode
 *.pyc
 wandb/
-.DS_Store
 impl_resources
 AGENTS.md
 checkpoints/
-.vscode
+eval_videos/

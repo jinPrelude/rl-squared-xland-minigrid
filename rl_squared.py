@@ -134,14 +134,10 @@ def make_minibatches(transitions, advantages, returns, init_carry, env_indices, 
     )
 
 
-def evaluate(model, env, env_params, rng_key, num_episodes):
-    """Evaluate agent over num_episodes consecutive episodes. Vmap externally for batch eval."""
-    def _cond_fn(carry):
-        _, stats, _, _, _, _ = carry
-        return stats.episodes_done < num_episodes
-
-    def _body_fn(carry):
-        rng, stats, timestep, prev_action, prev_reward, hstate = carry
+def evaluate(model, env, env_params, rng_key, num_steps):
+    """Evaluate agent over num_steps steps. Vmap externally for batch eval."""
+    def _step_fn(carry, _):
+        rng, timestep, prev_action, prev_reward, hstate, stats = carry
         rng, action_rng = jax.random.split(rng)
 
         done = timestep.last().astype(jnp.float32)
@@ -161,14 +157,15 @@ def evaluate(model, env, env_params, rng_key, num_episodes):
             length_sum=stats.length_sum + 1,
             episodes_done=stats.episodes_done + new_timestep.last().astype(jnp.int32),
         )
-        return (rng, stats, new_timestep, action, new_timestep.reward, new_hstate)
+        return (rng, new_timestep, action, new_timestep.reward, new_hstate, stats), new_timestep.reward
 
     reset_rng, eval_rng = jax.random.split(rng_key)
     timestep = env.reset(env_params, reset_rng)
     init_hstate = jax.tree.map(lambda x: x[0], model.init_carry(1, nnx.Rngs(0)))
 
     init_carry = (
-        eval_rng, RolloutStats(), timestep,
-        jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0.0), init_hstate,
+        eval_rng, timestep,
+        jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0.0), init_hstate, RolloutStats(),
     )
-    return jax.lax.while_loop(_cond_fn, _body_fn, init_carry)[1]
+    (_, _, _, _, _, stats), step_rewards = jax.lax.scan(_step_fn, init_carry, None, length=num_steps)
+    return stats, step_rewards

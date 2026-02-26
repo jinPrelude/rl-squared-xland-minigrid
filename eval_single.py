@@ -1,5 +1,6 @@
 """Single-environment evaluation with video recording."""
 
+import os
 from argparse import ArgumentParser
 
 import flax.nnx as nnx
@@ -33,10 +34,10 @@ def parse_arguments():
     parser.add_argument("--head-hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
     parser.add_argument("--action-emb-dim", type=int, default=16)
-    parser.add_argument("--episodes-per-trial", type=int, default=15)
+    parser.add_argument("--num-steps-per-env", type=int, default=5120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--output", type=str, default="eval_video.mp4")
+    parser.add_argument("--output-dir", type=str, default="./eval_videos/")
     parser.add_argument("--fps", type=int, default=10)
     return parser.parse_args()
 
@@ -44,31 +45,22 @@ def parse_arguments():
 _cached_episode_plot = {"n": -1, "img": None}
 
 
-def render_episode_plot(completed_rewards, total_episodes, width, height=100):
+def render_episode_plot(completed_rewards, episode_end_steps, total_steps, width, height=100):
     n = len(completed_rewards)
     if n == _cached_episode_plot["n"] and _cached_episode_plot["img"] is not None:
         return _cached_episode_plot["img"]
 
     dpi = 100
     fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
-    x_max = max(total_episodes, n)
-    ax.set_xlim(0.5, x_max + 0.5)
+    ax.set_xlim(0, total_steps)
     ax.set_ylim(0, 1.05)
-    ax.set_xlabel("Episode", fontsize=7)
+    ax.set_xlabel("Timestep", fontsize=7)
     ax.set_ylabel("Return", fontsize=7)
     ax.tick_params(labelsize=6)
 
-    if x_max <= 20:
-        ax.set_xticks(range(1, x_max + 1))
-    else:
-        tick_step = max(1, x_max // 10)
-        ticks = list(range(1, x_max + 1, tick_step))
-        if ticks[-1] != x_max:
-            ticks.append(x_max)
-        ax.set_xticks(ticks)
-
     if completed_rewards:
-        ax.bar(range(1, n + 1), completed_rewards, color="steelblue", width=0.7)
+        ax.plot(episode_end_steps, completed_rewards, color="steelblue",
+                marker="o", markersize=3, linewidth=1.2)
 
     fig.tight_layout()
     fig.canvas.draw()
@@ -84,25 +76,27 @@ def render_episode_plot(completed_rewards, total_episodes, width, height=100):
 
 
 def compose_frame(env_frame, episode_num, step_in_episode,
-                  current_reward, completed_rewards, total_episodes, goal_text=""):
+                  total_step, completed_rewards, episode_end_steps,
+                  total_steps, goal_text=""):
     W = env_frame.shape[1]
     hud = np.full((54, W, 3), 40, dtype=np.uint8)
     hud_img = Image.fromarray(hud)
     draw = ImageDraw.Draw(hud_img)
-    draw.text((5, 5), f"Ep: {episode_num + 1}/{total_episodes}  Step: {step_in_episode}  R: {current_reward:.2f}",
+    draw.text((5, 5), f"Ep: {episode_num + 1}  Step: {step_in_episode}  Total: {total_step}",
               fill=(255, 255, 255))
     if goal_text:
         draw.text((5, 25), f"Goal: {goal_text}", fill=(255, 255, 100))
-    episode_img = render_episode_plot(completed_rewards, total_episodes, width=W)
+    episode_img = render_episode_plot(completed_rewards, episode_end_steps, total_steps, width=W)
     return np.concatenate([env_frame, np.array(hud_img), episode_img], axis=0)
 
 
 def main():
     args = parse_arguments()
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
     env, env_params = make_env(args.env_id)
     num_actions = env.num_actions(env_params)
-    max_episode_steps = env_params.max_steps
 
     model = make_model(args, num_actions, nnx.Rngs(0))
     step = load_checkpoint(model, args.ckpt_dir, args.ckpt_step)
@@ -121,6 +115,9 @@ def main():
     else:
         rng, sample_rng = jax.random.split(rng)
         ruleset = test_benchmark.sample_ruleset(sample_rng)
+
+    env_index_str = str(args.env_index) if args.env_index is not None else "random"
+    output_path = os.path.join(args.output_dir, f"eval_video_env{env_index_str}.mp4")
 
     eval_env_params = env_params.replace(ruleset=ruleset)
     goal_text = _text_encode_goal(ruleset.goal.tolist())
@@ -151,29 +148,33 @@ def main():
     prev_action = jnp.asarray(0, dtype=jnp.int32)
     prev_reward = jnp.asarray(0.0)
 
-    total_steps = args.episodes_per_trial * max_episode_steps
     episode_num = 0
     step_in_episode = 0
     episode_reward = 0.0
     episode_rewards = []
+    episode_end_steps = []
+    global_step = 0
     frames = []
 
     print("JIT compiling...")
     _ = jit_step(timestep, prev_action, prev_reward, carry, rng)
 
-    print(f"Running {args.episodes_per_trial} episodes ({total_steps} steps)...")
-    for _ in tqdm(range(total_steps), desc="Eval"):
+    print(f"Running {args.num_steps_per_env} steps...")
+    for _ in tqdm(range(args.num_steps_per_env), desc="Eval"):
         env_frame = env.render(eval_env_params, timestep)
         frames.append(compose_frame(env_frame, episode_num, step_in_episode,
-                                    episode_reward, episode_rewards, args.episodes_per_trial,
+                                    global_step, episode_rewards,
+                                    episode_end_steps, args.num_steps_per_env,
                                     goal_text=goal_text))
 
         new_timestep, action, new_carry, rng = jit_step(timestep, prev_action, prev_reward, carry, rng)
+        global_step += 1
         step_in_episode += 1
         episode_reward += float(new_timestep.reward)
 
         if bool(new_timestep.last()):
             episode_rewards.append(episode_reward)
+            episode_end_steps.append(global_step)
             print(f"  Episode {episode_num + 1}: return={episode_reward:.3f}, length={step_in_episode}")
             episode_num += 1
             step_in_episode = 0
@@ -185,8 +186,8 @@ def main():
         timestep = new_timestep
 
     print(f"Writing {len(frames)} frames to video...")
-    imageio.mimwrite(args.output, frames, fps=args.fps, quality=8, macro_block_size=1)
-    print(f"Saved video to {args.output}")
+    imageio.mimwrite(output_path, frames, fps=args.fps, quality=8, macro_block_size=1)
+    print(f"Saved video to {output_path}")
     print(f"Episode returns: {[f'{r:.3f}' for r in episode_rewards]}")
     print(f"Mean return: {np.mean(episode_rewards):.3f}")
 

@@ -5,6 +5,9 @@ from argparse import ArgumentParser
 
 import flax.nnx as nnx
 import jax
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 
 from shared import make_env, make_model, load_checkpoint, load_test_benchmark
@@ -23,12 +26,39 @@ def parse_arguments():
     parser.add_argument("--head-hidden-dim", type=int, default=256)
     parser.add_argument("--obs-emb-dim", type=int, default=16)
     parser.add_argument("--action-emb-dim", type=int, default=16)
-    parser.add_argument("--episodes-per-trial", type=int, default=15)
+    parser.add_argument("--num-steps-per-env", type=int, default=2560)
     parser.add_argument("--eval-num-envs", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="eval_results.csv")
+    parser.add_argument("--num-segments", type=int, default=10)
+    parser.add_argument("--plot-output", type=str, default="eval_segment_rewards.png")
     return parser.parse_args()
+
+
+def plot_segment_rewards(step_rewards, num_segments, save_path, num_envs):
+    """Plot per-segment reward sums averaged across environments."""
+    num_steps = step_rewards.shape[1]
+    segment_size = num_steps // num_segments
+    segmented = step_rewards[:, :segment_size * num_segments].reshape(
+        num_envs, num_segments, segment_size,
+    )
+    segment_sums = segmented.sum(axis=2)             # (num_envs, num_segments)
+    means = segment_sums.mean(axis=0)                # (num_segments,)
+    stds = segment_sums.std(axis=0)                  # (num_segments,)
+
+    x = np.arange(1, num_segments + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.fill_between(x, means - stds, means + stds, alpha=0.2, color="steelblue")
+    ax.plot(x, means, marker="o", markersize=4, color="steelblue")
+    ax.set_xlabel("Segment")
+    ax.set_ylabel("Reward sum (mean across envs)")
+    ax.set_title(f"Segment-wise Reward Mean ({num_segments} segments, {num_envs} envs)")
+    ax.set_xticks(x)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def main():
@@ -49,16 +79,17 @@ def main():
     eval_rulesets = jax.vmap(test_benchmark.sample_ruleset)(eval_ruleset_keys)
     eval_env_params = env_params.replace(ruleset=eval_rulesets)
 
-    print(f"Evaluating on {args.eval_num_envs} test environments ({args.episodes_per_trial} episodes each)...")
+    print(f"Evaluating on {args.eval_num_envs} test environments ({args.num_steps_per_env} steps each)...")
     eval_rng_keys = jax.random.split(run_rng, args.eval_num_envs)
-    eval_stats = jax.vmap(
-        lambda rng_k, params: evaluate(model, env, params, rng_k, args.episodes_per_trial),
+    eval_stats, step_rewards = jax.vmap(
+        lambda rng_k, params: evaluate(model, env, params, rng_k, args.num_steps_per_env),
         in_axes=(0, 0),
     )(eval_rng_keys, eval_env_params)
 
     reward_sums = np.asarray(eval_stats.reward_sum)
     length_sums = np.asarray(eval_stats.length_sum)
     episodes_done = np.asarray(eval_stats.episodes_done)
+    step_rewards = np.asarray(step_rewards)  # (num_envs, num_steps)
 
     with open(args.output, "w", newline="") as f:
         writer = csv.writer(f)
@@ -70,6 +101,9 @@ def main():
     print(f"\n--- Summary ({args.eval_num_envs} environments) ---")
     print(f"Reward  mean: {reward_sums.mean():.4f}  median: {np.median(reward_sums):.4f}  std: {reward_sums.std():.4f}")
     print(f"Length  mean: {length_sums.mean():.1f}")
+
+    plot_segment_rewards(step_rewards, args.num_segments, args.plot_output, args.eval_num_envs)
+    print(f"Saved segment reward plot to {args.plot_output}")
 
 
 if __name__ == "__main__":
